@@ -48,27 +48,92 @@ export class CollectionClient<T extends Record<string, any> = Record<string, any
   /**
    * Insert multiple documents in a single atomic operation.
    */
-  async insertMany(documents: T[]): Promise<InsertResult[]> {
-    const now = Date.now();
-    const docs = documents.map((doc) => ({
-      ...doc,
-      _id: uuidv7(),
-      _createdAt: now,
-      _updatedAt: now,
-    })) as Document<T>[];
+ async insertMany(documents: T[]): Promise<InsertResult[]> {
+  const now = Date.now();
 
-    try {
-      await this.table.bulkAdd(docs);
-      return docs.map((d) => ({ id: d._id }));
-    } catch (err) {
-      throw new ZerithDBError(
-        ErrorCode.DB_WRITE_FAILED,
-        `Failed to bulk insert into collection "${this.collectionName}"`,
-        { cause: err }
-      );
+  // 🔹 Normalize documents with system fields
+  const docs = documents.map((doc) => ({
+    ...doc,
+    _id: uuidv7(),
+    _createdAt: now,
+    _updatedAt: now,
+  })) as Document<T>[];
+
+  const CHUNK_SIZE = 1000;
+
+  try {
+    // ================================
+    // ⚡ FAST PATH: Native IndexedDB
+    // ================================
+    // Use native IndexedDB when available for lower-overhead bulk writes.
+    // This avoids Dexie overhead and improves bulk insert performance
+    // on Chromium-based browsers.
+    const nativeDb = (this.table.db as any).backendDB?.();
+
+    if (nativeDb) {
+      const storeName = this.collectionName;
+
+      // Process in chunks to avoid:
+      // - long blocking transactions
+      // - memory spikes
+      // - browser transaction limits
+      for (let i = 0; i < docs.length; i += CHUNK_SIZE) {
+        const chunk = docs.slice(i, i + CHUNK_SIZE);
+
+        await new Promise<void>((resolve, reject) => {
+          // Create a single transaction per chunk for optimal throughput
+          const tx = nativeDb.transaction([storeName], "readwrite", {
+            // relaxed durability improves write throughput on Chromium
+            durability: "relaxed",
+          } as any);
+
+          const store = tx.objectStore(storeName);
+
+          // Bulk write inside one transaction
+          for (const doc of chunk) {
+            // put() is used intentionally:
+            // - allows upserts (insert or overwrite)
+            // - prevents duplicate-key failures during retries
+            store.put(doc);
+          }
+
+          // Resolve when transaction successfully completes
+          tx.oncomplete = () => resolve();
+
+          // Fail fast on any IndexedDB error
+          tx.onerror = () => reject(tx.error);
+          tx.onabort = () => reject(tx.error);
+        });
+      }
     }
-  }
 
+    // ================================
+    // 🛡 SAFE FALLBACK: Dexie path
+    // ================================
+    // Used when native IndexedDB access is unavailable.
+    // This ensures cross-browser compatibility.
+    else {
+      for (let i = 0; i < docs.length; i += CHUNK_SIZE) {
+        const chunk = docs.slice(i, i + CHUNK_SIZE);
+
+        // Dexie bulkAdd is optimized internally for batching
+        await this.table.bulkPut(chunk);
+      }
+    }
+
+    // ================================
+    // ✅ Return inserted IDs
+    // ================================
+    return docs.map((d) => ({ id: d._id }));
+  } catch (err) {
+    // Wrap all low-level DB errors into a unified error type
+    throw new ZerithDBError(
+      ErrorCode.DB_WRITE_FAILED,
+      `Failed to bulk insert into collection "${this.collectionName}"`,
+      { cause: err }
+    );
+  }
+}
   /**
    * Find documents matching a filter.
    * All filter fields are ANDed together.
